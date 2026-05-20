@@ -1,0 +1,6 @@
+gymnasium
+playwright
+numpy
+ollama
+openai
+anthropic
