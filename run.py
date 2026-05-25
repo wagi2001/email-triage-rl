@@ -1,387 +1,234 @@
 # run.py
+from __future__ import annotations
+
 import argparse
+import logging
 import os
 from datetime import datetime, timezone
 
-from email_data import OPEN_ACTION, ACTION_NAMES
-
+from config import Settings, project_root
 from env import EmailTriageEnv
 from agent import RandomAgent, RuleBasedAgent
+from logging_config import setup_logging
 from verifier import Verifier
 
-
-def _agent_meta(agent, mode):
-    meta = {"mode": mode}
-    if hasattr(agent, "provider"):
-        meta["provider"] = agent.provider
-    if hasattr(agent, "model"):
-        meta["model"] = agent.model
-    if hasattr(agent, "use_local"):
-        meta["use_local"] = agent.use_local
-    return meta
+logger = logging.getLogger(__name__)
 
 
-def _log_step(trajectory_logger, step_idx, email_idx, action_idx, reward, terminated, truncated, llm_raw=None):
-    if trajectory_logger:
-        trajectory_logger.log_step(
-            step_idx, email_idx, action_idx, reward, terminated, truncated,
-            llm_raw_response=llm_raw,
-        )
+# ------------------------------------------------------------------
+# Episode runner
+# ------------------------------------------------------------------
 
-
-def _open_email_if_needed(env, obs, email_idx, trajectory_logger, step_idx):
-    """Reveal sender for email_idx when partial observability is on."""
-    if not env.partial_obs or env.is_email_opened(email_idx):
-        return obs, 0.0, False, False, step_idx
-    open_idx = ACTION_NAMES.index(OPEN_ACTION)
-    obs, reward, terminated, truncated, _ = env.step([email_idx, open_idx])
-    _log_step(trajectory_logger, step_idx, email_idx, open_idx, reward, terminated, truncated)
-    return obs, reward, terminated, truncated, step_idx + 1
-
-
-def _llm_response(agent):
-    return getattr(agent, "last_response", None)
-
-
-def run_episode(
-    env,
-    agent,
-    verifier,
-    ep_num,
-    mode="random",
-    trajectory_logger=None,
-):
+def run_episode(env, agent, verifier, ep_num, mode="random", trajectory_logger=None, quiet=False):
     obs, info = env.reset(seed=ep_num)
 
     if trajectory_logger:
-        meta = _agent_meta(agent, mode)
-        meta["partial_obs"] = env.partial_obs
         trajectory_logger.begin_episode(
             episode=ep_num,
             seed=ep_num,
             rule=env.rule,
             emails=env.emails,
             mode=mode,
-            agent_meta=meta,
+            agent_meta={"mode": mode},
         )
 
     print(f"\n{'='*60}")
-    print(f"Episode {ep_num+1} — mode: {mode}")
+    print(f"Episode {ep_num + 1}  |  mode: {mode}")
     print(f"Rule: {info['rule']}")
-    print(f"{'='*60}")
+    if not quiet:
+        print(f"{'='*60}")
 
-    total_reward = 0.0
-    done = False
+    # Let agents that care (e.g. LLMAgent) know the current episode number
+    if hasattr(agent, "current_episode"):
+        agent.current_episode = ep_num + 1
+
+    done     = False
     step_idx = 0
 
-    if mode == "random":
-        while not done:
-            action = agent.act(obs)
-            obs, reward, terminated, truncated, _ = env.step(action)
-            if trajectory_logger:
-                trajectory_logger.log_step(
-                    step_idx,
-                    int(action[0]),
-                    int(action[1]),
-                    reward,
-                    terminated,
-                    truncated,
-                )
-            step_idx += 1
-            done = terminated or truncated
-            total_reward += reward
-
-    elif mode in ("rule_based", "llm"):
-        for email_idx in range(len(env.emails)):
-            obs, r, term, trunc, step_idx = _open_email_if_needed(
-                env, obs, email_idx, trajectory_logger, step_idx
+    while not done:
+        action = agent.act(obs, info)
+        obs, reward, terminated, truncated, info = env.step(action)
+        if trajectory_logger:
+            trajectory_logger.log_step(
+                step_idx, int(action[0]), int(action[1]),
+                info.get("raw_reward", reward), terminated, truncated,
             )
-            total_reward += r
-            if term or trunc:
-                done = True
-                break
+        step_idx += 1
+        done = terminated or truncated
 
-            action_idx = agent.act(obs, email_idx)
-            obs, reward, terminated, truncated, _ = env.step([email_idx, action_idx])
-            _log_step(
-                trajectory_logger, step_idx, email_idx, action_idx,
-                reward, terminated, truncated,
-                llm_raw=_llm_response(agent) if mode == "llm" else None,
-            )
-            step_idx += 1
-            total_reward += reward
-            if terminated or truncated:
-                break
-
-    # --- Verify ---
     verdict = verifier.log_verify(
-        env.rule,
-        env.emails,
-        env.actions_taken,
-        n_steps=step_idx,
+        env.rule, env.emails, env.actions_taken,
         partial_obs=env.partial_obs,
         opened_ids=env.opened_ids,
     )
 
-    # Consistency check: verifier score must match env reward
-    try:
-        verifier.assert_reward_consistency(
-            env_reward=total_reward,
-            rule=env.rule,
-            emails=env.emails,
-            actions_taken=env.actions_taken,
-            n_steps=step_idx,
-            partial_obs=env.partial_obs,
-            opened_ids=env.opened_ids,
-        )
-        consistency = "PASS"
-    except AssertionError as e:
-        consistency = f"FAIL — {e}"
-
     if trajectory_logger:
         trajectory_logger.end_episode(
-            env.actions_taken,
-            total_reward,
-            verdict,
-            reward_consistency=consistency,
+            env.actions_taken, env.episode_return, verdict,
             opened_ids=env.opened_ids,
         )
 
-    print(verdict.summary())
-    print(f"\nReward consistency check: {consistency}")
+    if quiet:
+        print(
+            f"  score={verdict.total_score:.3f}  "
+            f"triage={verdict.triage_accuracy*100:.1f}%  "
+            f"efficiency={verdict.reward_efficiency*100:.1f}%"
+        )
+    else:
+        print(verdict.summary())
 
     return verdict
 
 
-def _trajectories_dir():
-    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "trajectories")
+# ------------------------------------------------------------------
+# Agent runners
+# ------------------------------------------------------------------
+
+def _env_kwargs(render_mode, difficulty, partial_obs=True,
+                use_threads=False, page_size=None):
+    n_emails = 12 if difficulty in ("hard", "expert") else 8
+    return dict(n_emails=n_emails, render_mode=render_mode,
+                difficulty=difficulty, partial_obs=partial_obs,
+                use_threads=use_threads, page_size=page_size)
 
 
-def _default_trajectory_path(agent, model=None):
-    """Single file overwritten each run (no timestamped history)."""
-    return os.path.join(_trajectories_dir(), "latest.jsonl")
+def _wrap_env(env, normalize_reward: bool):
+    if normalize_reward:
+        from training_wrappers import NormalizeReward
+        env = NormalizeReward(env)
+        logger.debug("NormalizeReward wrapper applied")
+    return env
 
 
-def _resolve_trajectory_path(path):
-    dirpath = _trajectories_dir()
-    os.makedirs(dirpath, exist_ok=True)
-    if os.path.isabs(path):
-        return path
-    return os.path.join(dirpath, os.path.basename(path))
-
-
-def _reset_trajectory_file(path):
-    """Delete all old JSONL logs and start a fresh file for this run."""
-    dirpath = _trajectories_dir()
-    os.makedirs(dirpath, exist_ok=True)
-    for name in os.listdir(dirpath):
-        if name.endswith(".jsonl"):
-            os.remove(os.path.join(dirpath, name))
-    path = _resolve_trajectory_path(path)
-    open(path, "w", encoding="utf-8").close()
-    return path
-
-
-def _make_trajectory_logger(path, agent_name, model=None, provider=None):
-    from trajectory_logger import TrajectoryLogger
-
-    path = _resolve_trajectory_path(path)
-    run_meta = {
-        "agent": agent_name,
-        "started_at": datetime.now(timezone.utc).isoformat(),
-    }
-    if model:
-        run_meta["model"] = model
-    if provider:
-        run_meta["provider"] = provider
-    return TrajectoryLogger(path, run_meta=run_meta), path
-
-
-def _env_kwargs(render_mode, difficulty, partial_obs=True):
-    n_emails = 12 if difficulty == "hard" else 8
-    return {
-        "n_emails": n_emails,
-        "render_mode": render_mode,
-        "difficulty": difficulty,
-        "partial_obs": partial_obs,
-    }
-
-
-def run_random(n_episodes=3, trajectory_path=None, render_mode="human", difficulty="easy", partial_obs=True):
-    print("\n" + "="*60)
+def run_random(n_episodes=3, trajectory_path=None, render_mode=None,
+               difficulty="easy", partial_obs=True, normalize_reward=False, quiet=False,
+               use_threads=False, page_size=None):
+    print("\n" + "=" * 60)
     print("RANDOM AGENT")
-    print("="*60)
+    print("=" * 60)
 
-    env = EmailTriageEnv(**_env_kwargs(render_mode, difficulty, partial_obs))
-    agent = RandomAgent(env.action_space)
+    env      = _wrap_env(EmailTriageEnv(**_env_kwargs(render_mode, difficulty, partial_obs, use_threads, page_size)), normalize_reward)
+    agent    = RandomAgent(env.action_space)
     verifier = Verifier()
-    logger = None
-    if trajectory_path:
-        logger, trajectory_path = _make_trajectory_logger(trajectory_path, "random")
+    traj     = _make_traj_logger(trajectory_path, "random")
 
     scores = []
     for ep in range(n_episodes):
-        verdict = run_episode(
-            env, agent, verifier, ep, mode="random", trajectory_logger=logger
-        )
-        scores.append(verdict.total_score)
-
+        scores.append(run_episode(env, agent, verifier, ep, mode="random", trajectory_logger=traj, quiet=quiet).total_score)
     env.close()
 
-    if logger:
-        print(f"\nTrajectories logged to: {trajectory_path}")
-
-    print(f"\nRandom agent summary over {n_episodes} episodes:")
-    print(f"  Scores:  {[round(s, 3) for s in scores]}")
-    print(f"  Average: {sum(scores)/len(scores):.3f}")
-
-
-def run_rule_based(n_episodes=3, trajectory_path=None, render_mode="human", difficulty="easy", partial_obs=True):
-    print("\n" + "="*60)
-    print("RULE-BASED AGENT (should score near max)")
-    print("="*60)
-
-    env = EmailTriageEnv(**_env_kwargs(render_mode, difficulty, partial_obs))
-    agent = RuleBasedAgent(env)
-    verifier = Verifier()
-    logger = None
-    if trajectory_path:
-        logger, trajectory_path = _make_trajectory_logger(trajectory_path, "rule")
-
-    scores = []
-    triage_accs = []
-    eff_accs = []
-    for ep in range(n_episodes):
-        verdict = run_episode(
-            env, agent, verifier, ep, mode="rule_based", trajectory_logger=logger
-        )
-        scores.append(verdict.total_score)
-        triage_accs.append(verdict.triage_accuracy)
-        eff_accs.append(verdict.reward_efficiency)
-
-    env.close()
-
-    if logger:
-        print(f"\nTrajectories logged to: {trajectory_path}")
-
-    print(f"\nRule-based agent summary over {n_episodes} episodes:")
-    print(f"  Scores:             {[round(s, 3) for s in scores]}")
-    print(f"  Triage accuracy:    {[f'{a*100:.1f}%' for a in triage_accs]}")
-    print(f"  Reward efficiency:  {[f'{a*100:.1f}%' for a in eff_accs]}")
-    print(f"  Avg score:          {sum(scores)/len(scores):.3f}")
+    _print_summary("Random", scores, n_episodes)
 
 
 def run_llm(
-    n_episodes=2,
-    model=None,
-    render_mode="human",
-    provider="ollama",
-    use_local=False,
-    trajectory_path=None,
-    difficulty="easy",
-    partial_obs=True,
+    n_episodes=2, model=None, provider="ollama", use_local=False,
+    trajectory_path=None, render_mode=None,
+    difficulty="easy", partial_obs=True, normalize_reward=False, quiet=False,
+    use_threads=False, page_size=None,
 ):
-    """Run unified LLMAgent (provider: ollama | openai | anthropic)."""
     from llm_agent import LLMAgent, verify_ollama_key
 
     if provider == "ollama":
         if use_local:
-            print("Using local Ollama at http://localhost:11434 (run `ollama serve`).")
+            from llm_agent import _ollama_default_host
+            print(f"Local Ollama at {_ollama_default_host(use_local=True)}")
         elif os.environ.get("OLLAMA_API_KEY"):
-            print("Verifying OLLAMA_API_KEY with a test chat request...")
+            print("Verifying OLLAMA_API_KEY …")
             verify_ollama_key(model=model)
             print("API key OK.")
         else:
-            print(
-                "Note: OLLAMA_API_KEY not set — using local Ollama at "
-                "http://localhost:11434 (run `ollama serve` and pull a model)."
-            )
+            print("OLLAMA_API_KEY not set — falling back to local Ollama.")
             use_local = True
-
-    print(f"\nProvider: {provider}  |  model: {model or '(from env/default)'}")
 
     print("\n" + "=" * 60)
     print(f"{provider.upper()} LLM AGENT")
     print("=" * 60)
 
-    env = EmailTriageEnv(**_env_kwargs(render_mode, difficulty, partial_obs))
-    agent = LLMAgent(env, provider=provider, model=model, use_local=use_local)
+    env      = _wrap_env(EmailTriageEnv(**_env_kwargs(render_mode, difficulty, partial_obs, use_threads, page_size)), normalize_reward)
+    agent    = LLMAgent(env, provider=provider, model=model, use_local=use_local)
     verifier = Verifier()
-    logger = None
-    if trajectory_path:
-        logger, trajectory_path = _make_trajectory_logger(
-            trajectory_path, provider, model=agent.model
-        )
+    traj     = _make_traj_logger(trajectory_path, provider)
 
-    scores = []
-    triage_accs = []
-    eff_accs = []
+    print(f"Model: {agent.model}")
+    scores, triage, eff = [], [], []
     for ep in range(n_episodes):
-        verdict = run_episode(
-            env, agent, verifier, ep, mode="llm", trajectory_logger=logger
-        )
-        scores.append(verdict.total_score)
-        triage_accs.append(verdict.triage_accuracy)
-        eff_accs.append(verdict.reward_efficiency)
-
+        v = run_episode(env, agent, verifier, ep, mode="llm", trajectory_logger=traj, quiet=quiet)
+        scores.append(v.total_score)
+        triage.append(v.triage_accuracy)
+        eff.append(v.reward_efficiency)
     env.close()
 
-    if logger:
-        print(f"\nTrajectories logged to: {trajectory_path}")
-
-    print(f"\n{provider} summary over {n_episodes} episodes:")
-    print(f"  Model:              {agent.model}")
+    print(f"\n{provider} ({agent.model}) summary over {n_episodes} episodes:")
     print(f"  Scores:             {[round(s, 3) for s in scores]}")
-    print(f"  Triage accuracy:    {[f'{a*100:.1f}%' for a in triage_accs]}")
-    print(f"  Reward efficiency:  {[f'{a*100:.1f}%' for a in eff_accs]}")
+    print(f"  Triage accuracy:    {[f'{a*100:.1f}%' for a in triage]}")
+    print(f"  Reward efficiency:  {[f'{a*100:.1f}%' for a in eff]}")
     print(f"  Avg score:          {sum(scores)/len(scores):.3f}")
 
 
-def run_dom_verify(n_episodes=2, trajectory_path=None, render_mode="human", difficulty="easy", partial_obs=True):
-    """
-    Runs the rule-based agent then cross-checks with DOM verification.
-    Both log_verify and dom_verify should produce identical scores.
-    """
-    print("\n" + "="*60)
-    print("DOM VERIFICATION CROSS-CHECK")
-    print("="*60)
+def run_rule_based(n_episodes=3, trajectory_path=None, render_mode=None,
+                   difficulty="easy", partial_obs=True, normalize_reward=False, quiet=False,
+                   use_threads=False, page_size=None):
+    print("\n" + "=" * 60)
+    print("RULE-BASED AGENT  (should score near max)")
+    print("=" * 60)
 
-    env = EmailTriageEnv(**_env_kwargs(render_mode, difficulty, partial_obs))
-    agent = RuleBasedAgent(env)
+    env      = _wrap_env(EmailTriageEnv(**_env_kwargs(render_mode, difficulty, partial_obs, use_threads, page_size)), normalize_reward)
+    agent    = RuleBasedAgent()
     verifier = Verifier()
-    logger = None
-    if trajectory_path:
-        logger, trajectory_path = _make_trajectory_logger(trajectory_path, "dom")
+    traj     = _make_traj_logger(trajectory_path, "rule")
 
+    scores, triage, eff = [], [], []
     for ep in range(n_episodes):
-        run_episode(
-            env, agent, verifier, ep, mode="rule_based", trajectory_logger=logger
-        )
-        kw = dict(
-            n_steps=env.step_count,
-            partial_obs=env.partial_obs,
-            opened_ids=env.opened_ids,
-        )
-        dom_verdict = verifier.dom_verify(env.rule, env.emails, env._page, **kw)
-        log_verdict = verifier.log_verify(
-            env.rule, env.emails, env.actions_taken, **kw
-        )
-
-        log_score = round(log_verdict.total_score, 4)
-        dom_score = round(dom_verdict.total_score, 4)
-        match = "MATCH" if log_score == dom_score else "MISMATCH"
-
-        print(f"  dom_verify score: {dom_score}")
-        print(f"  DOM vs log: {match}")
-
+        v = run_episode(env, agent, verifier, ep, mode="rule_based", trajectory_logger=traj, quiet=quiet)
+        scores.append(v.total_score)
+        triage.append(v.triage_accuracy)
+        eff.append(v.reward_efficiency)
     env.close()
 
-    if logger:
-        print(f"\nTrajectories logged to: {trajectory_path}")
+    print(f"\nRule-based summary over {n_episodes} episodes:")
+    print(f"  Scores:             {[round(s, 3) for s in scores]}")
+    print(f"  Triage accuracy:    {[f'{a*100:.1f}%' for a in triage]}")
+    print(f"  Reward efficiency:  {[f'{a*100:.1f}%' for a in eff]}")
+    print(f"  Avg score:          {sum(scores)/len(scores):.3f}")
 
+
+# ------------------------------------------------------------------
+# Trajectory helpers
+# ------------------------------------------------------------------
+
+def _trajectories_dir():
+    return os.path.join(project_root(), Settings.from_env().trajectory_dir)
+
+
+def _make_traj_logger(path, agent_name):
+    if path is None:
+        return None
+    from trajectory_logger import TrajectoryLogger
+    run_meta = {"agent": agent_name, "started_at": datetime.now(timezone.utc).isoformat()}
+    return TrajectoryLogger(path, run_meta=run_meta)
+
+
+def _print_summary(name, scores, n):
+    print(f"\n{name} summary over {n} episodes:")
+    print(f"  Scores:  {[round(s, 3) for s in scores]}")
+    print(f"  Average: {sum(scores)/len(scores):.3f}")
+
+
+def _reset_trajectory_file(path):
+    dirpath = _trajectories_dir()
+    os.makedirs(dirpath, exist_ok=True)
+    for name in os.listdir(dirpath):
+        if name.endswith(".jsonl"):
+            os.remove(os.path.join(dirpath, name))
+    open(path, "w", encoding="utf-8").close()
+    return path
+
+
+# ------------------------------------------------------------------
+# CLI
+# ------------------------------------------------------------------
 
 def _load_dotenv():
-    """Load .env into os.environ (does not override existing vars)."""
     path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
     if not os.path.isfile(path):
         return
@@ -393,119 +240,124 @@ def _load_dotenv():
             key, _, value = line.partition("=")
             key = key.strip()
             value = value.strip().strip('"').strip("'")
-            if key:
-                # .env should win over empty shell exports; never override a real key
-                if value or key not in os.environ:
-                    os.environ[key] = value.strip()
+            if key and (value or key not in os.environ):
+                os.environ[key] = value
 
 
 def main():
     _load_dotenv()
-    parser = argparse.ArgumentParser(description="Email triage RL demo runners")
+    settings = Settings.from_env()
+
+    parser = argparse.ArgumentParser(description="Email triage RL environment runner")
     parser.add_argument(
         "--agent",
-        choices=["random", "rule", "ollama", "openai", "anthropic", "dom", "all"],
-        default="ollama",
-        help="Which agent to run (default: ollama)",
-    )
-    parser.add_argument("--episodes", type=int, default=2, help="Episodes per agent")
-    parser.add_argument(
-        "--model",
-        default=None,
-        help="Model name (overrides OPENAI_MODEL / ANTHROPIC_MODEL / OLLAMA_MODEL)",
+        choices=["random", "rule", "all", "ollama", "openai", "anthropic"],
+        default="all",
+        help="Which agent to run (default: all)",
     )
     parser.add_argument(
-        "--headless",
-        action="store_true",
-        help="Run browser without visible window",
+        "--model", default=None,
+        help="LLM model name (overrides OLLAMA_MODEL / OPENAI_MODEL / ANTHROPIC_MODEL)",
     )
     parser.add_argument(
-        "--list-models",
-        action="store_true",
+        "--local", action="store_true",
+        help="Use local Ollama at localhost:11434 instead of cloud",
+    )
+    parser.add_argument(
+        "--list-models", action="store_true",
         help="List available Ollama models and exit",
     )
     parser.add_argument(
-        "--local",
-        action="store_true",
-        help="Use local Ollama (localhost:11434) instead of ollama.com cloud API",
+        "--episodes", type=int, default=settings.default_episodes,
+        help="Episodes per agent",
     )
     parser.add_argument(
-        "--no-log-trajectories",
-        action="store_true",
-        help="Disable automatic JSONL trajectory logging",
+        "--difficulty", choices=["easy", "medium", "hard", "expert"],
+        default=settings.default_difficulty,
+        help="Episode difficulty",
     )
     parser.add_argument(
-        "--trajectory-log",
-        default=None,
-        metavar="PATH",
-        help="Override trajectory file (default: trajectories/latest.jsonl; old logs cleared each run)",
+        "--partial-obs", action=argparse.BooleanOptionalAction, default=True,
+        help="Hide sender until opened (default: on)",
     )
     parser.add_argument(
-        "--difficulty",
-        choices=["easy", "medium", "hard"],
-        default="easy",
-        help="easy=random inbox; medium=guaranteed matches+decoys; hard=subject rules+12 emails",
+        "--normalize-reward", action="store_true", default=settings.normalize_reward,
+        help="Wrap env with NormalizeReward (for RL training loops)",
     )
     parser.add_argument(
-        "--partial-obs",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Hide sender until each email is opened (default: on). "
-        "Use --no-partial-obs to show all senders.",
+        "--render", action="store_true", default=False,
+        help="Open browser UI (default: headless / no browser)",
+    )
+    parser.add_argument(
+        "--threads", action="store_true", default=False,
+        help="Each email is a thread; agent must expand before triaging",
+    )
+    parser.add_argument(
+        "--page-size", type=int, default=None, metavar="N",
+        help="Split inbox into pages of N emails; agent must navigate with next_page",
+    )
+    parser.add_argument(
+        "--quiet", action="store_true",
+        help="Structured log output instead of verbose console",
+    )
+    parser.add_argument(
+        "--no-log-trajectories", action="store_true",
+        help="Disable JSONL trajectory logging",
     )
     args = parser.parse_args()
+    setup_logging(settings.log_level, quiet=args.quiet)
 
     if args.list_models:
-        from llm_agent import list_ollama_models, print_provider_hints
-
+        from llm_agent import list_ollama_models
         list_ollama_models()
-        print("\nNote: listing cloud models does NOT require a valid API key.")
-        print("Chat (/api/chat) does — run with your key or use --local.")
         print("\nLocal Ollama (if ollama serve is running):")
         list_ollama_models(host="http://localhost:11434")
-        print_provider_hints()
         return
+
+    render_mode = "human" if args.render else None
 
     traj_path = None
     if not args.no_log_trajectories:
-        traj_path = args.trajectory_log or _default_trajectory_path(
-            args.agent, args.model
-        )
-        traj_path = _reset_trajectory_file(traj_path)
+        dirpath   = _trajectories_dir()
+        os.makedirs(dirpath, exist_ok=True)
+        traj_path = _reset_trajectory_file(os.path.join(dirpath, "latest.jsonl"))
         print(f"Trajectory log: {traj_path}")
 
-    render = None if args.headless else "human"
     diff = args.difficulty
     pobs = args.partial_obs
+    norm = args.normalize_reward
+
     if diff != "easy":
         print(f"Difficulty: {diff}")
-    if pobs:
-        print("Partial observability: senders hidden until opened (default)")
-    else:
-        print("Full observability: all senders visible")
+    print(f"Partial obs: {'on' if pobs else 'off'}")
+    if norm:
+        print("Reward normalisation: enabled")
+    if render_mode:
+        print("Browser: visible")
 
     kw = dict(
         n_episodes=args.episodes,
         trajectory_path=traj_path,
-        render_mode=render,
+        render_mode=render_mode,
         difficulty=diff,
         partial_obs=pobs,
+        normalize_reward=norm,
+        quiet=args.quiet,
+        use_threads=args.threads,
+        page_size=args.page_size,
     )
+
+    if args.threads:
+        print("Threads: on")
+    if args.page_size:
+        print(f"Page size: {args.page_size}")
 
     if args.agent in ("random", "all"):
         run_random(**kw)
     if args.agent in ("rule", "all"):
         run_rule_based(**kw)
-    if args.agent == "ollama":
-        run_llm(**kw, model=args.model, provider="ollama", use_local=args.local)
-    if args.agent == "openai":
-        run_llm(**kw, model=args.model, provider="openai")
-    if args.agent == "anthropic":
-        run_llm(**kw, model=args.model, provider="anthropic")
-    if args.agent == "dom":
-        run_dom_verify(**kw)
-    if args.agent == "all":
-        run_dom_verify(**{**kw, "n_episodes": min(2, args.episodes)})
+    if args.agent in ("ollama", "openai", "anthropic"):
+        run_llm(**kw, model=args.model, provider=args.agent, use_local=args.local)
 
 
 if __name__ == "__main__":

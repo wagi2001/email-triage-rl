@@ -1,0 +1,29 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest pytest-cov
+
+      - name: Run tests (sim-only, no Playwright)
+        run: pytest tests/ -v --cov=. --cov-report=term-missing
+
+      - name: Rule-based smoke (no browser)
+        run: python run.py --agent rule --episodes 1 --difficulty medium --no-browser --quiet
